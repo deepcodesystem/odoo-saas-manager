@@ -95,9 +95,10 @@
                         <group>
                             <group string="Credentials">
                                 <field name="admin_login"/>
-                                <field name="admin_password" password="True"/>
+                                <field name="company_name" placeholder="Nom de la société cliente (optionnel)"/>
+                                <field name="admin_password" password="True" groups="saas_manager.group_saas_admin"/>
                                 <field name="agent_impersonate_login"/>
-                                <field name="agent_secret" readonly="1"/>
+                                <field name="agent_secret" readonly="1" groups="saas_manager.group_saas_admin"/>
                             </group>
                             <group string="User Management">
                                 <field name="user_limit"/>
@@ -108,7 +109,8 @@
                         </group>
                         <group>
                             <group string="Storage">
-                                <field name="storage_used" readonly="1"/>
+                                <field name="storage_used"/>
+                                <field name="monitor_failures"/>
                             </group>
                             <group string="Dates">
                                 <field name="activation_date" readonly="1"/>

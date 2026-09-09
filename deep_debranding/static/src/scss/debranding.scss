@@ -1,0 +1,9 @@
+/* Masquage des éléments Odoo selon les toggles Debranding (classes posées par ui_toggles.js) */
+
+body.o_deep_hide_share {
+    /* Bouton de partage du systray et des listes */
+    .o_web_share,
+    .o_systray_item.o_share_button {
+        display: none !important;
+    }
+}

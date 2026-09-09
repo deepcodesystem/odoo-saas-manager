@@ -14,6 +14,10 @@ from odoo.modules.registry import Registry
 
 _logger = logging.getLogger(__name__)
 
+# Logins jamais impersonables via SSO (comptes système — l'admin client
+# "admin" est en revanche un compte utilisateur légitime et reste permis)
+FORBIDDEN_SSO_LOGINS = {'__system__', 'public'}
+
 
 class SaaSAgentController(http.Controller):
     """Endpoints exposés au master pour contrôle SaaS."""
@@ -100,19 +104,42 @@ class SaaSAgentController(http.Controller):
         sudo_env = request.env['res.users'].sudo()
         user_id = payload.get('user_id')
         if user_id:
-            return sudo_env.browse(int(user_id))
+            user = sudo_env.browse(int(user_id))
+            return user if self._is_sso_allowed(user) else sudo_env.browse()
 
         login = payload.get('user_login')
         if login:
+            if login.lower() in FORBIDDEN_SSO_LOGINS:
+                _logger.warning("SSO request refused for protected login %s", login)
+                return sudo_env.browse()
             user = sudo_env.search([('login', '=', login)], limit=1)
-            if user:
-                return user
+            return user if self._is_sso_allowed(user) else sudo_env.browse()
 
         config_user_id = request.env['ir.config_parameter'].sudo().get_param('saas_agent.impersonate_user_id')
         if config_user_id:
-            return sudo_env.browse(int(config_user_id))
+            user = sudo_env.browse(int(config_user_id))
+            return user if self._is_sso_allowed(user) else sudo_env.browse()
 
-        return sudo_env.browse(2)
+        # No fallback on admin: an explicit user must be configured
+        _logger.warning("SSO request without target user and no saas_agent.impersonate_user_id configured")
+        return sudo_env.browse()
+
+    @staticmethod
+    def _is_sso_allowed(user):
+        """Refuse l'impersonation du superuser et des comptes système.
+
+        L'admin client (uid 2, login 'admin') est un compte utilisateur
+        légitime : l'impersonation reste permise pour lui.
+        """
+        if not user or not user.exists():
+            return False
+        if user.id == SUPERUSER_ID:
+            _logger.warning("SSO impersonation of superuser refused")
+            return False
+        if user.login and user.login.lower() in FORBIDDEN_SSO_LOGINS:
+            _logger.warning("SSO impersonation of protected login '%s' refused", user.login)
+            return False
+        return True
 
     def _build_login_url(self, token_record, redirect):
         base = request.httprequest.url_root.rstrip('/') + '/'
@@ -131,7 +158,7 @@ class SaaSAgentController(http.Controller):
 
         target_user = self._find_target_user(payload)
         if not target_user or not target_user.exists():
-            _logger.warning('SSO target user not found: payload=%s', payload)
+            _logger.warning('SSO target user not found or refused: payload=%s', payload)
             return self._json_error('User not found')
 
         exp_ts = payload.get('exp')
@@ -139,7 +166,7 @@ class SaaSAgentController(http.Controller):
             _logger.warning('SSO request missing exp: payload=%s', payload)
             return self._json_error('Missing exp')
 
-        expire_at = datetime.datetime.utcfromtimestamp(exp_ts)
+        expire_at = datetime.datetime.fromtimestamp(int(exp_ts), tz=datetime.timezone.utc).replace(tzinfo=None)
         if expire_at <= datetime.datetime.utcnow():
             _logger.warning('SSO request expired: exp=%s now=%s', expire_at, datetime.datetime.utcnow())
             return self._json_error('Token expired')
@@ -208,7 +235,7 @@ class SaaSAgentController(http.Controller):
         if not real_master:
             return {'success': False, 'error': 'Master password not configured on instance'}
 
-        if master_password != real_master:
+        if not secrets.compare_digest(str(master_password), str(real_master)):
             _logger.warning("Invalid master password in bootstrap request")
             return {'success': False, 'error': 'Invalid master password'}
 
@@ -228,9 +255,9 @@ class SaaSAgentController(http.Controller):
             _logger.info("Agent secret bootstrapped successfully via master password")
             return {'success': True}
 
-        except Exception as e:
-            _logger.exception("Bootstrap failed: %s", e)
-            return {'success': False, 'error': str(e)}
+        except Exception:
+            _logger.exception("Bootstrap failed")
+            return {'success': False, 'error': 'Internal error'}
 
     # ---- Direct JWT SSO (single-step, no intermediate token) ----
 
@@ -266,8 +293,12 @@ class SaaSAgentController(http.Controller):
                 _logger.warning("SSO JWT: db mismatch %s vs %s", payload.get('db'), db_name)
                 return request.redirect('/web/login?error=db_mismatch')
 
-            user_login = payload.get('user_login', 'admin')
+            user_login = payload.get('user_login')
             redirect_url = payload.get('redirect', '/web')
+
+            if not user_login or user_login.lower() in FORBIDDEN_SSO_LOGINS:
+                _logger.warning("SSO JWT: refused target login %s", user_login)
+                return request.redirect('/web/login?error=user_not_found')
 
             with registry.cursor() as cr:
                 env = api.Environment(cr, SUPERUSER_ID, {})
@@ -276,8 +307,8 @@ class SaaSAgentController(http.Controller):
                     ('active', '=', True),
                 ], limit=1)
 
-                if not user:
-                    _logger.warning("SSO JWT: user not found %s", user_login)
+                if not user or user.id == SUPERUSER_ID:
+                    _logger.warning("SSO JWT: user not found or protected %s", user_login)
                     return request.redirect('/web/login?error=user_not_found')
 
                 uid = user.id

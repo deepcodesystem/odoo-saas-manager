@@ -26,5 +26,21 @@
             <field name="value">True</field>
         </record>
 
+        <!-- Neutralization scope on cloned instances: none | light -->
+        <record id="saas_neutralize_scope" model="ir.config_parameter">
+            <field name="key">saas.neutralize_scope</field>
+            <field name="value">light</field>
+        </record>
+
+        <!-- User limit alert thresholds (percent) -->
+        <record id="saas_user_limit_warn_percent" model="ir.config_parameter">
+            <field name="key">saas.user_limit_warn_percent</field>
+            <field name="value">80</field>
+        </record>
+        <record id="saas_user_limit_alert_percent" model="ir.config_parameter">
+            <field name="key">saas.user_limit_alert_percent</field>
+            <field name="value">95</field>
+        </record>
+
     </data>
 </odoo>

@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="res_config_settings_view_form_debranding" model="ir.ui.view">
+        <field name="name">res.config.settings.view.form.inherit.deep_debranding</field>
+        <field name="model">res.config.settings</field>
+        <field name="priority">30</field>
+        <field name="inherit_id" ref="base.res_config_settings_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//form" position="inside">
+                <app groups="deep_debranding.group_debranding_admin" data-string="Debranding" string="Debranding" name="deep_debranding" logo="/deep_debranding/static/description/icon.png">
+                    <block title="Branding" name="deep_branding_container">
+                        <setting id="deep_system_name_setting" string="System Name" help="Nom affiché à la place de 'Odoo'">
+                            <field name="app_system_name" placeholder="DeepOS"/>
+                        </setting>
+                        <setting id="deep_poweredby_setting" string="Powered by" help="Mention affichée en bas de la page de connexion">
+                            <div class="content-group">
+                                <div class="row mt8">
+                                    <field name="app_show_poweredby"/>
+                                    <label for="app_show_poweredby"/>
+                                </div>
+                                <div class="row mt8" invisible="not app_show_poweredby">
+                                    <field name="app_poweredby_text" placeholder="DeepOS"/>
+                                </div>
+                                <div class="row mt8" invisible="not app_show_poweredby">
+                                    <field name="app_poweredby_url" placeholder="https://www.exemple.com"/>
+                                </div>
+                            </div>
+                        </setting>
+                        <setting id="deep_copyright_setting" string="Footer Copyright" help="Copyright du footer frontend (module website requis)">
+                            <field name="app_copyright_text" placeholder="Copyright (c) Votre Société"/>
+                        </setting>
+                    </block>
+                    <block title="Menu utilisateur" name="deep_usermenu_container">
+                        <setting id="deep_lang_setting" string="Sélecteur de langues" help="Affiche un sélecteur rapide de langues dans le menu utilisateur">
+                            <field name="app_show_lang"/>
+                        </setting>
+                        <setting id="deep_debug_setting" string="Débogage rapide" help="Affiche le mode développeur dans le menu utilisateur (réservé aux gestionnaires)">
+                            <field name="app_show_debug"/>
+                        </setting>
+                        <setting id="deep_documentation_setting" string="Documentation">
+                            <div class="content-group">
+                                <div class="row mt8">
+                                    <field name="app_show_documentation"/>
+                                    <label for="app_show_documentation"/>
+                                </div>
+                                <div class="row mt8" invisible="not app_show_documentation">
+                                    <field name="app_documentation_url" placeholder="https://www.exemple.com/docs"/>
+                                </div>
+                            </div>
+                        </setting>
+                        <setting id="deep_support_setting" string="Support">
+                            <div class="content-group">
+                                <div class="row mt8">
+                                    <field name="app_show_support"/>
+                                    <label for="app_show_support"/>
+                                </div>
+                                <div class="row mt8" invisible="not app_show_support">
+                                    <field name="app_support_url" placeholder="https://www.exemple.com/support"/>
+                                </div>
+                            </div>
+                        </setting>
+                        <setting id="deep_account_setting" string="Mon compte">
+                            <div class="content-group">
+                                <div class="row mt8">
+                                    <field name="app_show_account"/>
+                                    <label for="app_show_account"/>
+                                </div>
+                                <div class="row mt8" invisible="not app_show_account">
+                                    <field name="app_account_title" placeholder="Mon compte"/>
+                                </div>
+                                <div class="row mt8" invisible="not app_show_account">
+                                    <field name="app_account_url" placeholder="https://www.exemple.com/compte"/>
+                                </div>
+                            </div>
+                        </setting>
+                    </block>
+                    <block title="Masquage Odoo" name="deep_hide_container">
+                        <setting id="deep_enterprise_setting" string="Tag Enterprise" help="Décocher pour masquer les tags Enterprise">
+                            <field name="app_show_enterprise"/>
+                        </setting>
+                        <setting id="deep_share_setting" string="Partage" help="Décocher pour masquer les boutons de partage">
+                            <field name="app_show_share"/>
+                        </setting>
+                        <setting id="deep_referral_setting" string="Odoo Referral" help="Décocher pour masquer les recommandations Odoo">
+                            <field name="module_odoo_referral"/>
+                        </setting>
+                        <setting id="deep_enterprise_url_setting" string="URL modules Enterprise" help="Réécrit l'URL du site des modules sous licence Enterprise">
+                            <div class="content-group">
+                                <div class="row mt8">
+                                    <field name="app_enterprise_url" class="oe_inline" placeholder="https://www.exemple.com"/>
+                                    <button string="Appliquer" type="object" name="set_module_url" class="ml8 oe_highlight"/>
+                                </div>
+                            </div>
+                        </setting>
+                    </block>
+                    <block title="Ruban d'environnement" name="deep_ribbon_container">
+                        <setting id="deep_ribbon_setting" string="Ruban" help="Bandeau affiché dans le backend (ex. TEST, DÉMO). Vide = masqué">
+                            <div class="content-group">
+                                <div class="row mt8">
+                                    <field name="app_ribbon_name" placeholder="DÉMO"/>
+                                </div>
+                                <div class="row mt8" invisible="not app_ribbon_name">
+                                    <field name="app_ribbon_color" placeholder="#f0f0f0"/>
+                                </div>
+                                <div class="row mt8" invisible="not app_ribbon_name">
+                                    <field name="app_ribbon_background_color" placeholder="rgba(255,0,0,.4)"/>
+                                </div>
+                            </div>
+                        </setting>
+                    </block>
+                </app>
+            </xpath>
+        </field>
+    </record>
+</odoo>

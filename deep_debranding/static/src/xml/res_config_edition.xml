@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <!-- Remplace res_config_edition : nom système Debranding au lieu de "Odoo" -->
+    <t t-name="deep_debranding.ResConfigEdition">
+        <Setting addLabel="false">
+            <div class="user-heading">
+                <h3 class="px-0">
+                    <t t-esc="systemName"/>
+                    <t t-esc="serverVersion"/>
+                    (Community Edition)
+                </h3>
+            </div>
+            <div>
+                <div class="tab-content">
+                    <div role="tabpanel" id="settings" class="tab-pane active text-muted o_web_settings_compact_subtitle">
+                        <small>
+                            Copyright &#169; <t t-esc="systemName"/>
+                            <a target="_blank" href="https://www.gnu.org/licenses/lgpl.html" style="text-decoration: underline;">GNU LGPL Licensed</a>
+                        </small>
+                    </div>
+                </div>
+            </div>
+        </Setting>
+    </t>
+</templates>

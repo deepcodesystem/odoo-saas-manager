@@ -3,7 +3,7 @@
 
 {
     'name': 'SaaS Agent',
-    'version': '18.0.1.0.0',
+    'version': '18.0.1.1.0',
     'summary': 'Agent de contrôle pour instances SaaS (SSO, quotas)',
     'category': 'Administration',
     'author': 'DeepCode',

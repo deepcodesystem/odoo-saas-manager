@@ -3,7 +3,7 @@
 
 {
     'name': 'SaaS Manager',
-    'version': '18.0.1.24.0',
+    'version': '18.0.1.29.2',
     'category': 'Administration',
     'summary': 'Multi-DB SaaS management with ultra-fast provisioning',
     'description': '''
@@ -45,6 +45,7 @@
         
         # Configuration
         'data/ir_config_parameter.xml',
+        'data/mail_activity_type_data.xml',
 
         # Master data
         'data/saas_server_data.xml',

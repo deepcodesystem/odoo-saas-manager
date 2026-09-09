@@ -79,6 +79,31 @@
             <field name="domain_force">[(1, '=', 1)]</field>
         </record>
 
+        <!-- Record Rules for SaaS Instance : isolation client -->
+        <!-- Un utilisateur simple ne voit que les instances de son partenaire (+ enfants) -->
+        <record id="saas_instance_rule_user_own_partner" model="ir.rule">
+            <field name="name">SaaS Instance - User sees only own instances</field>
+            <field name="model_id" ref="model_saas_instance"/>
+            <field name="groups" eval="[(4, ref('group_saas_user'))]"/>
+            <field name="perm_read">1</field>
+            <field name="perm_create">0</field>
+            <field name="perm_write">0</field>
+            <field name="perm_unlink">0</field>
+            <field name="domain_force">[('partner_id', 'child_of', user.partner_id.id)]</field>
+        </record>
+
+        <!-- Managers et admins voient toutes les instances -->
+        <record id="saas_instance_rule_manager_all" model="ir.rule">
+            <field name="name">SaaS Instance - Manager can see all instances</field>
+            <field name="model_id" ref="model_saas_instance"/>
+            <field name="groups" eval="[(4, ref('group_saas_manager')), (4, ref('group_saas_admin'))]"/>
+            <field name="perm_read">1</field>
+            <field name="perm_create">1</field>
+            <field name="perm_write">1</field>
+            <field name="perm_unlink">1</field>
+            <field name="domain_force">[(1, '=', 1)]</field>
+        </record>
+
         <!-- Record Rules for SaaS Plan -->
         <!--<record id="saas_plan_rule_manager_all" model="ir.rule">
             <field name="name">SaaS Plan - Manager can manage all plans</field>

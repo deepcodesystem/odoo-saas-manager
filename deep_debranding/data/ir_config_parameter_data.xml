@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <data noupdate="1">
+        <function model="ir.config_parameter" name="set_param" eval="('app_system_name', 'DeepOS')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_show_poweredby', 'False')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_poweredby_text', 'DeepOS')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_poweredby_url', 'https://www.deeposapps.com')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_show_documentation', 'True')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_documentation_url', 'https://www.deeposapps.com')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_show_support', 'True')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_support_url', 'https://www.deeposapps.com')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_show_account', 'True')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_account_title', 'DeepOS')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_account_url', 'https://www.deeposapps.com')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_show_enterprise', 'False')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_show_share', 'False')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_show_lang', 'True')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_show_debug', 'True')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_enterprise_url', 'https://www.deeposapps.com')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_ribbon_name', '')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_ribbon_color', '#f0f0f0')"/>
+        <function model="ir.config_parameter" name="set_param" eval="('app_ribbon_background_color', 'rgba(255,0,0,.4)')"/>
+    </data>
+</odoo>

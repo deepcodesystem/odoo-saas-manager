@@ -118,15 +118,25 @@ class SaaSInstance(models.Model):
     )
     admin_password = fields.Char(
         string='Admin Password',
-        help="Administrator password (stored encrypted in production)"
+        groups='saas_manager.group_saas_admin',
+        copy=False,
+        help="Administrator password (restricted to SaaS Administrators)"
     )
     agent_secret = fields.Char(
         string='Agent Secret',
+        groups='saas_manager.group_saas_admin',
+        copy=False,
         help="Shared secret with saas_agent for JWT signatures"
     )
     agent_impersonate_login = fields.Char(
         string='SSO Login',
         help="Login utilisé pour l'impersonation par défaut"
+    )
+    company_name = fields.Char(
+        string='Company Name',
+        help="Nom de la société cliente à appliquer sur l'instance. "
+             "Vide : utilise le partner commercial (société) du client, "
+             "à défaut le nom du partner.",
     )
 
     # User Limit Management
@@ -142,7 +152,12 @@ class SaaSInstance(models.Model):
         string='Current Users',
         compute='_compute_current_users',
         store=False,
-        help="Current number of active users in instance (fetched via RPC)"
+        help="Current number of active users in instance (last synced value)"
+    )
+    last_users_count = fields.Integer(
+        string='Last Users Count',
+        default=0,
+        help="Last user count synced from the instance (avoids RPC on every read)"
     )
     users_percentage = fields.Float(
         string='Users Usage %',
@@ -157,8 +172,13 @@ class SaaSInstance(models.Model):
     )
     storage_used = fields.Float(
         string='Storage Used (GB)',
-        compute='_compute_storage_used',
-        help="Storage used in GB"
+        default=0.0,
+        help="Database size in GB (updated by the monitoring cron)",
+    )
+    monitor_failures = fields.Integer(
+        string='Monitoring Failures',
+        default=0,
+        help="Consecutive health check failures (reset on success)"
     )
     activation_date = fields.Datetime(
         string='Activation Date',
@@ -189,8 +209,8 @@ class SaaSInstance(models.Model):
     )
 
     _sql_constraints = [
-        ('database_name_unique', 'UNIQUE(database_name) WHERE state != \'draft\'', 'Database name must be unique!'),
-        ('subdomain_unique', 'UNIQUE(subdomain) WHERE state != \'draft\'', 'Subdomain must be unique!'),
+        ('database_name_unique', 'UNIQUE(database_name)', 'Database name must be unique!'),
+        ('subdomain_unique', 'UNIQUE(subdomain)', 'Subdomain must be unique!'),
     ]
 
     @api.depends('subdomain')
@@ -259,24 +279,129 @@ class SaaSInstance(models.Model):
 
     def _compute_current_users(self):
         """
-        Fetch current user count from instance via RPC.
+        Return the last synced user count (no RPC — avoids N+1 network calls
+        when listing instances). Use action_refresh_users_count or the sync
+        cron to fetch fresh values from the instance.
         """
         for instance in self:
-            if instance.state in ('active', 'suspended') and instance.domain:
-                instance.current_users = instance._get_users_count_from_instance()
+            if instance.state in ('active', 'suspended'):
+                instance.current_users = instance.last_users_count
             else:
                 instance.current_users = 0
 
-    def _compute_storage_used(self):
+    def _get_database_size_gb(self):
+        """Taille de la base de l'instance en Go (pg_database_size).
+
+        Connexion à la base 'postgres' du serveur hébergeant l'instance.
+        Retourne 0.0 en cas d'échec.
         """
-        Calcule l'espace disque utilisé.
-        Compute storage used.
-        
-        TODO Phase 2: Query PostgreSQL database size
+        self.ensure_one()
+        import psycopg2
+
+        server = self.server_id
+        try:
+            conn = psycopg2.connect(
+                host=server.db_host or 'localhost',
+                port=server.db_port or 5432,
+                user=server.db_user or 'odoo',
+                password=server.db_password or '',
+                dbname='postgres',
+                connect_timeout=10,
+            )
+            try:
+                with conn.cursor() as cr:
+                    cr.execute("SELECT pg_database_size(%s)", [self.database_name])
+                    row = cr.fetchone()
+                    if row and row[0]:
+                        return round(row[0] / (1024 ** 3), 3)
+            finally:
+                conn.close()
+        except Exception as exc:
+            _logger.warning("Could not get database size for %s: %s", self.database_name, exc)
+        return 0.0
+
+    def _ping_instance(self):
+        """Vérifier la disponibilité de l'instance via /web/health.
+
+        Retourne True si le endpoint répond HTTP 200.
         """
-        for instance in self:
-            # Placeholder - TODO Phase 2: Query database size
-            instance.storage_used = 0.0
+        self.ensure_one()
+        base_url = self._build_instance_url()
+        if not base_url:
+            return False
+        try:
+            response = requests.get(
+                f"{base_url}/web/health",
+                timeout=10,
+                verify=self._ssl_verify,
+                allow_redirects=True,
+            )
+            return response.status_code == 200
+        except requests.exceptions.RequestException as exc:
+            _logger.debug("Health check failed for %s: %s", self.name, exc)
+            return False
+
+    @api.model
+    def cron_monitor_instances(self):
+        """
+        CRON: Monitorer les instances actives (santé HTTP + taille base).
+
+        - storage_used ← pg_database_size
+        - /web/health : 2 échecs consécutifs → message chatter + activity
+          (jamais de suspension automatique)
+        """
+        _logger.info("Running instance monitoring...")
+
+        admin_users = self._get_saas_admin_users()
+        activity_type = 'saas_manager.mail_act_saas_alert'
+        max_failures = 2
+
+        active_instances = self.search([('state', '=', 'active')])
+        for instance in active_instances:
+            try:
+                # Storage
+                instance.storage_used = instance._get_database_size_gb()
+
+                # Health
+                if instance._ping_instance():
+                    if instance.monitor_failures:
+                        instance.write({'monitor_failures': 0})
+                    continue
+
+                failures = instance.monitor_failures + 1
+                instance.write({'monitor_failures': failures})
+
+                if failures >= max_failures:
+                    body = _(
+                        "Instance unreachable %(failures)d consecutive times "
+                        "(health check on %(url)s failed).",
+                        failures=failures,
+                        url=instance._build_instance_url() or 'N/A',
+                    )
+                    instance.message_post(body=body, message_type='comment')
+                    for user in admin_users:
+                        try:
+                            instance.activity_schedule(
+                                activity_type,
+                                user_id=user.id,
+                                note=body,
+                            )
+                        except Exception as act_exc:
+                            _logger.warning(
+                                "Could not schedule alert activity on %s: %s",
+                                instance.name, act_exc,
+                            )
+                    _logger.warning("Instance %s unreachable (failures=%d)",
+                                    instance.name, failures)
+
+            except Exception as e:
+                _logger.error(f"Monitoring failed for {instance.name}: {str(e)}")
+
+        _logger.info("Instance monitoring done: %d instances checked", len(active_instances))
+
+    def _get_saas_admin_users(self):
+        """Utilisateurs actifs du groupe SaaS Administrator (pour les alertes)."""
+        return self.env.ref('saas_manager.group_saas_admin').sudo().users.filtered('active')
 
     @api.depends('current_users', 'user_limit')
     def _compute_users_percentage(self):
@@ -329,6 +454,35 @@ class SaaSInstance(models.Model):
                         'Subdomain must start and end with a letter or number.'
                     ))
 
+    @api.constrains('subdomain', 'database_name')
+    def _check_subdomain_matches_database(self):
+        """Avertissement (non bloquant) si subdomain != database_name.
+
+        Le routing SaaS repose sur dbfilter = ^%d$ : le sous-domaine doit
+        correspondre au nom de la base.
+        """
+        for instance in self:
+            if (
+                instance.database_name
+                and instance.subdomain
+                and instance.subdomain != instance.database_name
+            ):
+                _logger.warning(
+                    "Instance %s: subdomain '%s' does not match database name "
+                    "'%s' (dbfilter routing requires them to be equal)",
+                    instance.name, instance.subdomain, instance.database_name,
+                )
+                if instance.id:
+                    instance.message_post(
+                        body=_(
+                            "Warning: subdomain '%(subdomain)s' does not match "
+                            "the database name '%(database)s'. With dbfilter "
+                            "routing, they must be identical.",
+                            subdomain=instance.subdomain,
+                            database=instance.database_name,
+                        ),
+                    )
+
     def action_provision_instance(self):
         """
         Provisionner l'instance complète (orchestration).
@@ -369,8 +523,9 @@ class SaaSInstance(models.Model):
         
         try:
             # Update state to provisioning
+            # (le commit explicite est volontairement évité : l'atomicité de la
+            # transaction est préservée et l'état 'draft' est restauré en cas d'échec)
             self.write({'state': 'provisioning'})
-            self.env.cr.commit()  # Commit state change
             
             _logger.info(f"Starting provisioning for instance: {self.name}")
             
@@ -414,7 +569,7 @@ class SaaSInstance(models.Model):
                 self._send_expiration_to_instance(False, self.expiration_date)
 
             # Step 8: Send provisioning email to customer
-            self._send_provisioning_email()
+            self._send_instance_email('provisioned')
 
             return {
                 'type': 'ir.actions.client',
@@ -480,60 +635,278 @@ class SaaSInstance(models.Model):
         # Call template's clone method which uses server's DB configuration
         self.template_id.clone_template_db(self.database_name)
 
+    # Purge légère du template : données métier de démonstration à supprimer
+    # dans chaque instance clonée. Ordre respectant les clés étrangères.
+    # Chaque requête est gardée par to_regclass (module non installé → ignorée).
+    NEUTRALIZE_LIGHT_QUERIES = [
+        # Communication (mails en attente, tracking, messages de chatter)
+        ("mail_mail", "DELETE FROM mail_mail"),
+        ("mail_tracking_value", "DELETE FROM mail_tracking_value"),
+        ("mail_activity", "DELETE FROM mail_activity"),
+        ("mail_message", "DELETE FROM mail_message"),
+        # Comptabilité
+        ("account_partial_reconcile", "DELETE FROM account_partial_reconcile"),
+        ("account_move_line", "DELETE FROM account_move_line"),
+        ("account_move", "DELETE FROM account_move"),
+        # Ventes / Achats
+        ("sale_order_line", "DELETE FROM sale_order_line"),
+        ("sale_order", "DELETE FROM sale_order"),
+        ("purchase_order_line", "DELETE FROM purchase_order_line"),
+        ("purchase_order", "DELETE FROM purchase_order"),
+        # Stock
+        ("stock_move_line", "DELETE FROM stock_move_line"),
+        ("stock_move", "DELETE FROM stock_move"),
+        ("stock_picking", "DELETE FROM stock_picking"),
+        # Secrets / état SaaS hérités du template (CRITIQUE : sans purge,
+        # toutes les instances partageraient le saas_agent.secret du template)
+        ("ir_config_parameter", """
+            DELETE FROM ir_config_parameter
+             WHERE key IN (
+                'saas_agent.secret',
+                'saas_agent.user_limit',
+                'saas_agent.expiration_date',
+                'saas_agent.suspended',
+                'saas_agent.instance_uuid',
+                'saas_agent.impersonate_user_id'
+             )
+        """),
+        # Utilisateurs de démo : hors système (1) et admin (2), et hors
+        # utilisateurs référencés par un ir.model.data (préserve base.public_user,
+        # base.default_user, base.template_portal… requis par Odoo)
+        ("res_users", """
+            DELETE FROM res_users
+             WHERE id NOT IN (1, 2)
+               AND NOT EXISTS (SELECT 1 FROM ir_model_data d
+                                WHERE d.model = 'res.users' AND d.res_id = res_users.id)
+        """),
+        # Partenaires hors sociétés, hors partenaires des utilisateurs restants,
+        # et hors partenaires référencés par un ir.model.data
+        ("res_partner", """
+            DELETE FROM res_partner
+             WHERE NOT EXISTS (SELECT 1 FROM res_company c WHERE c.partner_id = res_partner.id)
+               AND NOT EXISTS (SELECT 1 FROM res_users u WHERE u.partner_id = res_partner.id)
+               AND NOT EXISTS (SELECT 1 FROM ir_model_data d
+                                WHERE d.model = 'res.partner' AND d.res_id = res_partner.id)
+        """),
+    ]
+
+    def _get_neutralize_scope(self):
+        """Scope de purge : 'none' (rien), 'light' (purge métier, défaut)."""
+        return self.env['ir.config_parameter'].sudo().get_param(
+            'saas.neutralize_scope', 'light'
+        )
+
+    def _purge_database_light(self):
+        """Exécute la purge light sur la base de l'instance via psycopg2.
+
+        Fonctionne en local comme sur un serveur distant (les credentials
+        PostgreSQL du serveur sont utilisés).
+        """
+        self.ensure_one()
+        import psycopg2
+
+        server = self.server_id
+        conn = psycopg2.connect(
+            host=server.db_host or 'localhost',
+            port=server.db_port or 5432,
+            user=server.db_user or 'odoo',
+            password=server.db_password or '',
+            dbname=self.database_name,
+            connect_timeout=30,
+        )
+        try:
+            with conn.cursor() as cr:
+                total = 0
+                for table, query in self.NEUTRALIZE_LIGHT_QUERIES:
+                    cr.execute("SELECT to_regclass(%s)", [table])
+                    if not cr.fetchone()[0]:
+                        continue
+                    cr.execute(query)
+                    total += cr.rowcount
+                    _logger.info("Neutralize %s on %s: %s rows", table, self.database_name, cr.rowcount)
+            conn.commit()
+            _logger.info("Light neutralization of %s done: %s rows purged", self.database_name, total)
+        finally:
+            conn.close()
+
     def _neutralize_database(self):
         """
-        Neutraliser les données sensibles du template cloné.
-        Neutralize sensitive data from cloned template.
-        
-        TODO Phase 2: Implement with odoorpc
-        
-        Example implementation:
-            import odoorpc
-            
-            # Connect to instance database
-            odoo = odoorpc.ODOO(
-                host=config.get('odoo_host'),
-                port=config.get('odoo_port'),
-                protocol='jsonrpc+ssl'
-            )
-            
-            # Login as superuser
-            odoo.login(self.database_name, 'admin', 'admin')
-            
-            # Neutralize data
-            User = odoo.env['res.users']
-            Partner = odoo.env['res.partner']
-            Company = odoo.env['res.company']
-            
-            # Reset admin password
-            admin_user = User.browse(2)
-            User.write([admin_user], {'password': 'admin'})
-            
-            # Clear sensitive company data
-            companies = Company.search([])
-            Company.write(companies, {
-                'vat': False,
-                'company_registry': False,
-                'email': False,
-                'phone': False,
-            })
-            
-            # Anonymize demo users
-            demo_users = User.search([('id', '>', 2)])
-            for user_id in demo_users:
-                User.write([user_id], {
-                    'email': f'demo.user{user_id}@example.com',
-                    'password': 'demo',
-                })
-            
-            _logger.info(f"Database {self.database_name} neutralized")
+        Purger les données sensibles / de démonstration de l'instance clonée.
+
+        Scope piloté par le paramètre `saas.neutralize_scope` :
+        - 'none'  : aucune purge (déconseillé en production)
+        - 'light' : purge métier ciblée (défaut)
+
+        La neutralisation native Odoo (mails/crons) est recommandée en amont
+        sur les templates via scripts/neutralize_template.py.
         """
-        _logger.info(f"TODO Phase 2: Neutralize database {self.database_name}")
-        # Placeholder - actual implementation in Phase 2
+        scope = self._get_neutralize_scope()
+        if scope == 'none':
+            _logger.info("Neutralization skipped for %s (scope=none)", self.name)
+            return
+        if scope != 'light':
+            _logger.warning("Unknown saas.neutralize_scope %r, falling back to light", scope)
+
+        _logger.info("Neutralizing database %s (scope=light)", self.database_name)
+        try:
+            self._purge_database_light()
+            self.message_post(
+                body=_("Instance neutralized: template demo data purged."),
+            )
+        except Exception as exc:
+            # Non-bloquant : log + chatter, le provisioning continue
+            _logger.error("Neutralization failed for %s: %s", self.database_name, exc)
+            self.message_post(
+                body=_("Neutralization warning: purge failed (%s). "
+                       "The instance may still contain template demo data.") % exc,
+            )
 
     def _customize_instance(self):
-        _logger.info(f"Customizing instance {self.database_name}")
-        # Phase 2: customize company name, logo, etc. via RPC
+        """
+        Personnaliser l'instance clonée avec les informations du client.
+
+        Appliqué sur la société principale (res.company id 1) :
+        - name, email, vat, phone, mobile, website depuis le partner client
+        - adresse complète : street, street2, zip, city, country (par code ISO)
+        - logo depuis l'image du partner client (si présente)
+
+        Local : Registry direct. Distant : RPC avec les credentials admin
+        (l'appel se fait avant la création de l'admin client → on utilise
+        les credentials du template).
+        """
+        self.ensure_one()
+
+        partner = self.partner_id
+        if not partner:
+            _logger.info("No partner on instance %s, skipping customization", self.name)
+            return
+
+        # Source des informations société : le partner commercial (la société
+        # pour un contact rattaché), sinon le partner lui-même. Le champ
+        # company_name de l'instance est prioritaire sur le nom.
+        source = partner.commercial_partner_id or partner
+        _logger.info(
+            "Customizing %s from partner %s (commercial=%s, is_company=%s)",
+            self.database_name, partner.name, source.name, source.is_company,
+        )
+
+        company_vals = {
+            'name': self.company_name or source.name or False,
+            'email': source.email or False,
+            'vat': source.vat or False,
+            'phone': source.phone or False,
+            'mobile': source.mobile or False,
+            'website': source.website or False,
+            'street': source.street or False,
+            'street2': source.street2 or False,
+            'zip': source.zip or False,
+            'city': source.city or False,
+        }
+        company_vals = {k: v for k, v in company_vals.items() if v}
+        logo_data = source.image_1920 or False
+        # Le pays est résolu par code ISO côté instance (les ids peuvent différer)
+        country_code = source.country_id.code if source.country_id else False
+
+        _logger.info("Customizing instance %s with values: %s%s",
+                     self.database_name, list(company_vals),
+                     f" + country={country_code}" if country_code else "")
+
+        try:
+            if self._is_local_server():
+                self._customize_instance_local(company_vals, logo_data, country_code)
+            else:
+                self._customize_instance_rpc(company_vals, logo_data, country_code)
+        except Exception as exc:
+            # Non-bloquant : la personnalisation reste manuelle si elle échoue
+            _logger.error("Customization failed for %s: %s", self.database_name, exc)
+
+    def _customize_instance_local(self, company_vals, logo_data, country_code):
+        from odoo import api as _api, SUPERUSER_ID
+        from odoo.modules.registry import Registry as _Registry
+        registry = _Registry(self.database_name)
+        with registry.cursor() as cr:
+            env = _api.Environment(cr, SUPERUSER_ID, {})
+            company = env['res.company'].browse(1)
+            vals = dict(company_vals)
+            if logo_data:
+                vals['logo'] = logo_data
+            if country_code:
+                country = env['res.country'].search(
+                    [('code', '=', country_code)], limit=1)
+                if country:
+                    vals['country_id'] = country.id
+            company.write(vals)
+        _logger.info("Instance %s customized locally (company=%s)",
+                     self.database_name, company_vals.get('name'))
+
+    def _customize_instance_rpc(self, company_vals, logo_data, country_code):
+        """Personnalisation via RPC — nécessite des credentials admin.
+
+        À ce stade du provisioning, l'admin client n'existe pas encore :
+        on utilise les credentials admin du template si disponibles.
+        """
+        template = self.template_id
+        login = template.template_admin_login
+        password = template.template_admin_password
+        if not (login and password):
+            _logger.warning(
+                "No template admin credentials for %s — customization skipped "
+                "(set template_admin_login/template_admin_password on the template)",
+                self.database_name,
+            )
+            return
+
+        base = self.server_id.server_url.rstrip('/')
+        rpc_url = f"{base}/jsonrpc"
+
+        auth_resp = requests.post(rpc_url, json={
+            'jsonrpc': '2.0', 'method': 'call', 'id': 1,
+            'params': {
+                'service': 'common', 'method': 'authenticate',
+                'args': [self.database_name, login, password, {}],
+            },
+        }, timeout=30, verify=self._ssl_verify)
+        uid = auth_resp.json().get('result')
+        if not uid:
+            _logger.warning("Auth failed for customization on %s", self.database_name)
+            return
+
+        vals = dict(company_vals)
+        if logo_data:
+            vals['logo'] = logo_data
+        if country_code:
+            # Résoudre le pays par code ISO via RPC
+            country_resp = requests.post(rpc_url, json={
+                'jsonrpc': '2.0', 'method': 'call', 'id': 2,
+                'params': {
+                    'service': 'object', 'method': 'execute_kw',
+                    'args': [
+                        self.database_name, uid, password,
+                        'res.country', 'search_read',
+                        [[('code', '=', country_code)]], ['id'],
+                    ],
+                },
+            }, timeout=30, verify=self._ssl_verify)
+            countries = country_resp.json().get('result', [])
+            if countries:
+                vals['country_id'] = countries[0]['id']
+            else:
+                _logger.warning(
+                    "Country %s not found on instance %s", country_code, self.database_name
+                )
+
+        requests.post(rpc_url, json={
+            'jsonrpc': '2.0', 'method': 'call', 'id': 3,
+            'params': {
+                'service': 'object', 'method': 'execute_kw',
+                'args': [
+                    self.database_name, uid, password,
+                    'res.company', 'write', [[1], vals],
+                ],
+            },
+        }, timeout=60, verify=self._ssl_verify)
+        _logger.info("Instance %s customized via RPC (company=%s)",
+                     self.database_name, company_vals.get('name'))
 
     def _install_l10n_module(self):
         """Installe le module l10n correspondant au pays saas_country_id via RPC.
@@ -560,9 +933,12 @@ class SaaSInstance(models.Model):
             'AE': 'l10n_ae',
         }
 
-        country = getattr(self, 'saas_country_id', None)
+        country = getattr(self, 'saas_country_id', None) or self.partner_id.country_id
         if not country:
-            _logger.info("No saas_country_id on instance %s, skipping l10n install", self.name)
+            _logger.info(
+                "No country on instance %s (saas_country_id and partner), skipping l10n install",
+                self.name,
+            )
             return
 
         country_code = country.code
@@ -579,6 +955,59 @@ class SaaSInstance(models.Model):
         base_url = server.server_url.rstrip('/')
         rpc_url = f"{base_url}/jsonrpc"
 
+        def rpc_execute(model, method, args, kwargs=None, timeout=120, call_id=1):
+            """Helper RPC execute_kw vers l'instance."""
+            return requests.post(rpc_url, json={
+                'jsonrpc': '2.0', 'method': 'call', 'id': call_id,
+                'params': {
+                    'service': 'object', 'method': 'execute_kw',
+                    'args': [self.database_name, uid, self.admin_password,
+                             model, method, args, kwargs or {}],
+                },
+            }, timeout=timeout, verify=self._ssl_verify)
+
+        def install_module(module_name):
+            """Installer un module sur l'instance (non-bloquant)."""
+            search_resp = rpc_execute(
+                'ir.module.module', 'search',
+                [[['name', '=', module_name]]], timeout=30,
+            )
+            module_ids = search_resp.json().get('result', [])
+            if not module_ids:
+                _logger.warning("Module %s not found in instance %s", module_name, self.name)
+                return False
+
+            read_resp = rpc_execute(
+                'ir.module.module', 'read', [module_ids, ['state']], timeout=30,
+            )
+            module_info = read_resp.json().get('result', [])
+            if module_info and module_info[0].get('state') == 'installed':
+                _logger.info("Module %s already installed on %s", module_name, self.name)
+                return True
+
+            try:
+                install_resp = rpc_execute(
+                    'ir.module.module', 'button_immediate_install',
+                    [module_ids], timeout=120,
+                )
+                result = install_resp.json()
+                if result.get('error'):
+                    _logger.warning(
+                        "L10n install RPC error for %s (%s): %s",
+                        self.name, module_name,
+                        result['error'].get('data', {}).get('message', result['error'])
+                    )
+                    return False
+                _logger.info("L10n module %s install triggered on %s", module_name, self.name)
+                return True
+            except requests.exceptions.Timeout:
+                # button_immediate_install peut provoquer un restart du worker — normal
+                _logger.info(
+                    "L10n install timed out for %s (expected if worker restarts): module=%s",
+                    self.name, module_name
+                )
+                return True
+
         try:
             # 1. Authenticate
             auth_resp = requests.post(rpc_url, json={
@@ -593,91 +1022,67 @@ class SaaSInstance(models.Model):
                 _logger.warning("Auth failed for l10n install on %s", self.name)
                 return
 
-            # 2. Search module
-            search_resp = requests.post(rpc_url, json={
-                'jsonrpc': '2.0', 'method': 'call', 'id': 2,
-                'params': {
-                    'service': 'object', 'method': 'execute_kw',
-                    'args': [
-                        self.database_name, uid, self.admin_password,
-                        'ir.module.module', 'search',
-                        [[['name', '=', l10n_module]]],
-                    ],
-                },
-            }, timeout=30, verify=self._ssl_verify)
-            module_ids = search_resp.json().get('result', [])
-            if not module_ids:
-                _logger.warning("Module %s not found in instance %s", l10n_module, self.name)
-                return
+            # 2. Installer le module de localisation principal
+            # (uniquement le module général — pas les modules additionnels
+            # l10n_xx_* qui tireraient des applications hors du modèle métier)
+            install_module(l10n_module)
 
-            # 3. Check state (skip if already installed)
-            read_resp = requests.post(rpc_url, json={
-                'jsonrpc': '2.0', 'method': 'call', 'id': 3,
-                'params': {
-                    'service': 'object', 'method': 'execute_kw',
-                    'args': [
-                        self.database_name, uid, self.admin_password,
-                        'ir.module.module', 'read',
-                        [module_ids, ['state']],
-                    ],
-                },
-            }, timeout=30, verify=self._ssl_verify)
-            module_info = read_resp.json().get('result', [])
-            if module_info and module_info[0].get('state') == 'installed':
-                _logger.info("Module %s already installed on %s", l10n_module, self.name)
-                return
-
-            # 4. Install (button_immediate_install triggers registry reload on that instance)
-            try:
-                install_resp = requests.post(rpc_url, json={
-                    'jsonrpc': '2.0', 'method': 'call', 'id': 4,
-                    'params': {
-                        'service': 'object', 'method': 'execute_kw',
-                        'args': [
-                            self.database_name, uid, self.admin_password,
-                            'ir.module.module', 'button_immediate_install',
-                            [module_ids],
-                        ],
-                    },
-                }, timeout=120, verify=self._ssl_verify)
-                result = install_resp.json()
-                if result.get('error'):
-                    _logger.warning(
-                        "L10n install RPC error for %s: %s",
-                        self.name, result['error'].get('data', {}).get('message', result['error'])
-                    )
-                else:
-                    _logger.info("L10n module %s install triggered on %s", l10n_module, self.name)
-            except requests.exceptions.Timeout:
-                # button_immediate_install peut provoquer un restart du worker — normal
-                _logger.info(
-                    "L10n install timed out for %s (expected if worker restarts): module=%s",
-                    self.name, l10n_module
-                )
-
-            # 5. Apply chart template via direct registry access (SUPERUSER — contourne les ACL)
+            # 3. Apply chart template via direct registry access (SUPERUSER — contourne les ACL)
             import time as _time
             from odoo import api as _odoo_api, SUPERUSER_ID
             from odoo.modules.registry import Registry as _Registry
-            _time.sleep(4)  # Attendre le rechargement du registry post-install
+            _time.sleep(2)
             try:
-                _registry = _Registry(self.database_name)
+                # Registry.new() force un chargement frais : l10n_ma vient
+                # d'être installé par un autre worker (RPC) et le registry
+                # en cache de CE worker peut ne pas contenir le register des
+                # templates du nouveau module (KeyError 'template_data').
+                _registry = _Registry.new(self.database_name)
                 with _registry.cursor() as _cr:
                     _env = _odoo_api.Environment(_cr, SUPERUSER_ID, {})
                     _company = _env['res.company'].browse(1)
-                    _templates = _env['account.chart.template'].search(
-                        [('country_id.code', '=', country_code)], limit=1
+                    _chart_model = _env['account.chart.template']
+                    _country = _env['res.country'].search(
+                        [('code', '=', country_code)], limit=1
                     )
-                    if not _templates:
+                    if not _country:
                         _logger.warning(
-                            "No chart template for country %s on %s", country_code, self.name
+                            "Country %s not found on %s", country_code, self.name
                         )
                     else:
-                        _templates.try_loading(company=_company, install_demo=False)
-                        _logger.info(
-                            "Chart template %s applied to main company on %s",
-                            country_code, self.name
-                        )
+                        # Odoo 18 : sélection du template par pays
+                        _template_code = _chart_model._guess_chart_template(_country)
+                        if not _template_code or _template_code == 'generic_coa':
+                            _logger.warning(
+                                "No chart template for country %s on %s",
+                                country_code, self.name,
+                            )
+                        else:
+                            _chart_model.try_loading(
+                                _template_code, company=_company, install_demo=False,
+                            )
+                            # Forcer pays + devise de la société fiscale :
+                            # try_loading ne les change que si absents, or le
+                            # clone hérite de la config du template (USD/US).
+                            # La devise du pays peut être inactive sur le clone
+                            # → l'activer avant de l'assigner.
+                            _fiscal_currency = _country.currency_id
+                            _vals = {'country_id': _country.id}
+                            if _fiscal_currency:
+                                if not _fiscal_currency.active:
+                                    _fiscal_currency.sudo().write({'active': True})
+                                    _logger.info(
+                                        "Currency %s activated on %s",
+                                        _fiscal_currency.name, self.name,
+                                    )
+                                _vals['currency_id'] = _fiscal_currency.id
+                            _company.write(_vals)
+                            _logger.info(
+                                "Chart template %s applied to main company on %s "
+                                "(country=%s, currency=%s)",
+                                _template_code, self.name,
+                                _country.code, _fiscal_currency.name if _fiscal_currency else 'N/A',
+                            )
             except Exception as _ct_exc:
                 _logger.warning(
                     "Failed to apply chart template for country %s on %s: %s",
@@ -693,14 +1098,38 @@ class SaaSInstance(models.Model):
             _logger.warning("Failed to install l10n module %s on %s: %s", l10n_module, self.name, exc)
 
     def _is_local_server(self):
-        """Retourne True si le serveur de l'instance est le même que le serveur courant."""
+        """Retourne True si l'instance est hébergée sur ce même serveur Odoo.
+
+        1. Comparaison d'URL (comportement historique)
+        2. Fallback : la base est-elle joignable via la config PostgreSQL
+           du serveur ? (gère les cas dev.africasys.ma vs deeposapps.africasys.ma
+           qui pointent vers le même hôte)
+        """
         from urllib.parse import urlparse
         current_url = self.env['ir.config_parameter'].sudo().get_param('web.base.url', '')
         server_url = self.server_id.server_url or ''
-        return (
+        if (
             urlparse(server_url.rstrip('/')).netloc
             == urlparse(current_url.rstrip('/')).netloc
-        )
+        ):
+            return True
+
+        # Fallback : test de connexion PostgreSQL locale à la base de l'instance
+        import psycopg2
+        server = self.server_id
+        try:
+            conn = psycopg2.connect(
+                host=server.db_host or 'localhost',
+                port=server.db_port or 5432,
+                user=server.db_user or 'odoo',
+                password=server.db_password or '',
+                dbname=self.database_name,
+                connect_timeout=5,
+            )
+            conn.close()
+            return True
+        except Exception:
+            return False
 
     def _update_admin_via_registry(self, admin_login, admin_password):
         """Mise à jour directe via Registry (serveur local uniquement)."""
@@ -786,282 +1215,158 @@ class SaaSInstance(models.Model):
 
     def _configure_subdomain(self):
         """
-        Configurer le sous-domaine DNS et reverse proxy.
-        Configure subdomain DNS and reverse proxy.
-        
-        TODO Phase 2: Implement DNS/reverse proxy configuration
-        
-        Example implementation for Traefik:
-            # Add labels to Traefik configuration
-            # Or update nginx configuration
-            # Or configure Cloudflare DNS via API
-            
-            import requests
-            
-            # Example: Cloudflare API
-            cloudflare_api_key = config.get('cloudflare_api_key')
-            zone_id = config.get('cloudflare_zone_id')
-            
-            headers = {
-                'Authorization': f'Bearer {cloudflare_api_key}',
-                'Content-Type': 'application/json',
-            }
-            
-            data = {
-                'type': 'A',
-                'name': self.subdomain,
-                'content': config.get('server_ip'),
-                'proxied': True,
-            }
-            
-            response = requests.post(
-                f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records',
-                headers=headers,
-                json=data
+        Configurer le sous-domaine : cohérence dbfilter + URL de base de l'instance.
+
+        Le routing repose sur `dbfilter = ^%d$` : le sous-domaine est le nom
+        de la base et le reverse-proxy gère la résolution wildcard. Cette
+        étape aligne donc :
+        1. subdomain = database_name
+        2. web.base.url de l'instance clonée = https://{database}.{base_domain}
+        3. ping post-configuration (non bloquant)
+        """
+        self.ensure_one()
+
+        # 1. Aligner subdomain sur le nom de base (routing dbfilter)
+        if self.subdomain != self.database_name:
+            _logger.info(
+                "Aligning subdomain '%s' to database name '%s' for %s",
+                self.subdomain, self.database_name, self.name,
             )
-            
+            self.write({'subdomain': self.database_name})
+
+        instance_url = self._build_instance_url()
+        if not instance_url:
+            _logger.warning("No domain for %s, skipping base url config", self.name)
+            return
+
+        # 2. web.base.url dans l'instance clonée
+        try:
+            self._set_instance_base_url(instance_url)
+        except Exception as exc:
+            _logger.warning("Failed to set web.base.url on %s: %s", self.database_name, exc)
+
+        # 3. Ping (non bloquant) : vérifier que le reverse-proxy route
+        try:
+            response = requests.get(
+                f"{instance_url}/web/health",
+                timeout=10,
+                verify=self._ssl_verify,
+            )
             if response.status_code == 200:
-                _logger.info(f"DNS record created for {self.domain}")
+                _logger.info("Instance %s reachable at %s", self.name, instance_url)
             else:
-                _logger.error(f"DNS creation failed: {response.text}")
+                _logger.warning(
+                    "Instance %s ping returned HTTP %s — check reverse-proxy "
+                    "routing for %s", self.name, response.status_code, instance_url,
+                )
+        except requests.exceptions.RequestException as exc:
+            _logger.warning(
+                "Instance %s not reachable at %s yet (%s) — reverse-proxy or "
+                "DNS may not be configured", self.name, instance_url, exc,
+            )
+
+    def _set_instance_base_url(self, base_url):
+        """Écrire web.base.url dans la base de l'instance clonée."""
+        self.ensure_one()
+        if self._is_local_server():
+            from odoo import api as _api, SUPERUSER_ID
+            from odoo.modules.registry import Registry as _Registry
+            registry = _Registry(self.database_name)
+            with registry.cursor() as cr:
+                env = _api.Environment(cr, SUPERUSER_ID, {})
+                env['ir.config_parameter'].sudo().set_param('web.base.url', base_url)
+            _logger.info("web.base.url set locally on %s: %s", self.database_name, base_url)
+            return
+
+        # Serveur distant : RPC avec les credentials admin de l'instance
+        if not (self.admin_login and self.admin_password):
+            _logger.warning(
+                "No admin credentials to set web.base.url on %s", self.database_name
+            )
+            return
+        base = self.server_id.server_url.rstrip('/')
+        rpc_url = f"{base}/jsonrpc"
+
+        auth_resp = requests.post(rpc_url, json={
+            'jsonrpc': '2.0', 'method': 'call', 'id': 1,
+            'params': {
+                'service': 'common', 'method': 'authenticate',
+                'args': [self.database_name, self.admin_login, self.admin_password, {}],
+            },
+        }, timeout=30, verify=self._ssl_verify)
+        uid = auth_resp.json().get('result')
+        if not uid:
+            _logger.warning("Auth failed to set web.base.url on %s", self.database_name)
+            return
+
+        requests.post(rpc_url, json={
+            'jsonrpc': '2.0', 'method': 'call', 'id': 2,
+            'params': {
+                'service': 'object', 'method': 'execute_kw',
+                'args': [
+                    self.database_name, uid, self.admin_password,
+                    'ir.config_parameter', 'set_param',
+                    ['web.base.url', base_url],
+                ],
+            },
+        }, timeout=30, verify=self._ssl_verify)
+        _logger.info("web.base.url set via RPC on %s: %s", self.database_name, base_url)
+
+    def _send_instance_email(self, event):
         """
-        _logger.info(f"TODO Phase 2: Configure DNS for {self.domain}")
-        # Placeholder - actual implementation in Phase 2
+        Envoyer l'email de notification lié à un événement d'instance.
+        Send instance event notification email to customer.
 
-    def _send_provisioning_email(self):
-        """
-        Envoyer un email au client avec les détails de connexion à l'instance.
-        Send provisioning details email to customer with connection information.
+        Args:
+            event (str): suffix of the mail template xml id
+                ('provisioned', 'suspended', 'reactivated', 'terminated')
 
-        Utilise le modèle de mail 'mail_template_instance_provisioned' pour
-        envoyer un email professionnel avec les détails de l'instance.
-
-        Uses the 'mail_template_instance_provisioned' email template to send
-        a professional email with instance connection details.
+        Uses the 'saas_manager.mail_template_instance_<event>' template.
+        Returns True if the email was sent, False otherwise (non-blocking).
         """
         self.ensure_one()
+        template_xmlid = f'saas_manager.mail_template_instance_{event}'
 
         try:
-            # Get the email template for instance provisioning
-            template = self.env.ref(
-                'saas_manager.mail_template_instance_provisioned',
-                raise_if_not_found=False
-            )
+            template = self.env.ref(template_xmlid, raise_if_not_found=False)
 
             if not template:
                 _logger.warning(
-                    f"Email template 'saas_manager.mail_template_instance_provisioned' "
-                    f"not found. Skipping email notification for instance {self.name}"
+                    "Email template '%s' not found. "
+                    "Skipping email notification for instance %s",
+                    template_xmlid, self.name,
                 )
                 return False
 
-            # Check if partner has email
             if not self.partner_id.email:
                 _logger.warning(
-                    f"Customer {self.partner_id.name} has no email address. "
-                    f"Cannot send provisioning email for instance {self.name}"
+                    "Customer %s has no email address. "
+                    "Cannot send %s email for instance %s",
+                    self.partner_id.name, event, self.name,
                 )
                 return False
 
             _logger.info(
-                f"Sending provisioning email to {self.partner_id.email} "
-                f"for instance {self.name}"
+                "Sending %s email to %s for instance %s",
+                event, self.partner_id.email, self.name,
             )
 
-            # Send the email using the template
-            template.send_mail(
-                self.id,
-                force_send=True,
-                raise_exception=False
-            )
+            template.send_mail(self.id, force_send=True, raise_exception=False)
 
             _logger.info(
-                f"Provisioning email sent successfully to {self.partner_id.email} "
-                f"for instance {self.name}"
+                "%s email sent successfully to %s for instance %s",
+                event.capitalize(), self.partner_id.email, self.name,
             )
-
             return True
 
         except Exception as e:
+            # Don't raise error - the instance operation is complete,
+            # the email is just a notification
             _logger.error(
-                f"Failed to send provisioning email for instance {self.name}: {str(e)}",
-                exc_info=True
+                "Failed to send %s email for instance %s: %s",
+                event, self.name, e,
+                exc_info=True,
             )
-            # Don't raise error - provisioning is complete, email is just notification
-            return False
-
-    def _send_suspension_email(self):
-        """
-        Envoyer un email au client lors de la suspension de l'instance.
-        Send suspension notification email to customer.
-
-        Uses the 'mail_template_instance_suspended' email template.
-        """
-        self.ensure_one()
-
-        try:
-            # Get the email template for instance suspension
-            template = self.env.ref(
-                'saas_manager.mail_template_instance_suspended',
-                raise_if_not_found=False
-            )
-
-            if not template:
-                _logger.warning(
-                    f"Email template 'saas_manager.mail_template_instance_suspended' "
-                    f"not found. Skipping email notification for instance {self.name}"
-                )
-                return False
-
-            # Check if partner has email
-            if not self.partner_id.email:
-                _logger.warning(
-                    f"Customer {self.partner_id.name} has no email address. "
-                    f"Cannot send suspension email for instance {self.name}"
-                )
-                return False
-
-            _logger.info(
-                f"Sending suspension email to {self.partner_id.email} "
-                f"for instance {self.name}"
-            )
-
-            # Send the email using the template
-            template.send_mail(
-                self.id,
-                force_send=True,
-                raise_exception=False
-            )
-
-            _logger.info(
-                f"Suspension email sent successfully to {self.partner_id.email} "
-                f"for instance {self.name}"
-            )
-
-            return True
-
-        except Exception as e:
-            _logger.error(
-                f"Failed to send suspension email for instance {self.name}: {str(e)}",
-                exc_info=True
-            )
-            # Don't raise error - suspension is complete, email is just notification
-            return False
-
-    def _send_reactivation_email(self):
-        """
-        Envoyer un email au client lors de la réactivation de l'instance.
-        Send reactivation notification email to customer.
-
-        Uses the 'mail_template_instance_reactivated' email template.
-        """
-        self.ensure_one()
-
-        try:
-            # Get the email template for instance reactivation
-            template = self.env.ref(
-                'saas_manager.mail_template_instance_reactivated',
-                raise_if_not_found=False
-            )
-
-            if not template:
-                _logger.warning(
-                    f"Email template 'saas_manager.mail_template_instance_reactivated' "
-                    f"not found. Skipping email notification for instance {self.name}"
-                )
-                return False
-
-            # Check if partner has email
-            if not self.partner_id.email:
-                _logger.warning(
-                    f"Customer {self.partner_id.name} has no email address. "
-                    f"Cannot send reactivation email for instance {self.name}"
-                )
-                return False
-
-            _logger.info(
-                f"Sending reactivation email to {self.partner_id.email} "
-                f"for instance {self.name}"
-            )
-
-            # Send the email using the template
-            template.send_mail(
-                self.id,
-                force_send=True,
-                raise_exception=False
-            )
-
-            _logger.info(
-                f"Reactivation email sent successfully to {self.partner_id.email} "
-                f"for instance {self.name}"
-            )
-
-            return True
-
-        except Exception as e:
-            _logger.error(
-                f"Failed to send reactivation email for instance {self.name}: {str(e)}",
-                exc_info=True
-            )
-            # Don't raise error - reactivation is complete, email is just notification
-            return False
-
-    def _send_termination_email(self):
-        """
-        Envoyer un email au client lors de la suppression de l'instance.
-        Send termination notification email to customer.
-
-        Uses the 'mail_template_instance_terminated' email template.
-        """
-        self.ensure_one()
-
-        try:
-            # Get the email template for instance termination
-            template = self.env.ref(
-                'saas_manager.mail_template_instance_terminated',
-                raise_if_not_found=False
-            )
-
-            if not template:
-                _logger.warning(
-                    f"Email template 'saas_manager.mail_template_instance_terminated' "
-                    f"not found. Skipping email notification for instance {self.name}"
-                )
-                return False
-
-            # Check if partner has email
-            if not self.partner_id.email:
-                _logger.warning(
-                    f"Customer {self.partner_id.name} has no email address. "
-                    f"Cannot send termination email for instance {self.name}"
-                )
-                return False
-
-            _logger.info(
-                f"Sending termination email to {self.partner_id.email} "
-                f"for instance {self.name}"
-            )
-
-            # Send the email using the template
-            template.send_mail(
-                self.id,
-                force_send=True,
-                raise_exception=False
-            )
-
-            _logger.info(
-                f"Termination email sent successfully to {self.partner_id.email} "
-                f"for instance {self.name}"
-            )
-
-            return True
-
-        except Exception as e:
-            _logger.error(
-                f"Failed to send termination email for instance {self.name}: {str(e)}",
-                exc_info=True
-            )
-            # Don't raise error - termination is complete, email is just notification
             return False
 
     def action_suspend(self):
@@ -1080,7 +1385,7 @@ class SaaSInstance(models.Model):
         self._send_expiration_to_instance(True, self.expiration_date)
 
         # Send suspension email to customer
-        self._send_suspension_email()
+        self._send_instance_email('suspended')
 
         return {
             'type': 'ir.actions.client',
@@ -1109,7 +1414,7 @@ class SaaSInstance(models.Model):
         self._send_expiration_to_instance(False, self.expiration_date)
 
         # Send reactivation email to customer
-        self._send_reactivation_email()
+        self._send_instance_email('reactivated')
 
         return {
             'type': 'ir.actions.client',
@@ -1156,7 +1461,7 @@ class SaaSInstance(models.Model):
             _logger.info(f"Instance {self.name} ({self.database_name}) terminated successfully")
 
             # Send termination email to customer
-            self._send_termination_email()
+            self._send_instance_email('terminated')
 
             return {
                 'type': 'ir.actions.client',
@@ -1223,7 +1528,8 @@ class SaaSInstance(models.Model):
             response = requests.post(
                 rpc_url,
                 json=payload,
-                timeout=300  # Allow up to 5 minutes for database deletion
+                timeout=300,  # Allow up to 5 minutes for database deletion
+                verify=self._ssl_verify,
             )
 
             response.raise_for_status()
@@ -1299,32 +1605,11 @@ class SaaSInstance(models.Model):
         
         for instance in expired_instances:
             try:
-                instance.action_suspend()  # This will also send suspension email and notify agent
-                instance.write({'state': 'suspended'})
+                instance.action_suspend()  # sets state, notifies agent and emails customer
                 _logger.info(f"Instance {instance.name} marked as suspended due to subscription expiry")
-                
+
             except Exception as e:
                 _logger.error(f"Failed to expire instance {instance.name}: {str(e)}")
-
-    @api.model
-    def cron_monitor_instances(self):
-        """
-        CRON: Monitorer les instances (usage, santé).
-        CRON: Monitor instances (usage, health).
-        
-        TODO Phase 2: Implement monitoring
-        """
-        _logger.info("Running instance monitoring...")
-        
-        active_instances = self.search([('state', '=', 'active')])
-        
-        for instance in active_instances:
-            try:
-                # TODO Phase 2: Check database health, disk usage, etc.
-                _logger.debug(f"Monitoring instance {instance.name}")
-                
-            except Exception as e:
-                _logger.error(f"Monitoring failed for {instance.name}: {str(e)}")
 
     def action_sync_user_limit(self):
         """
@@ -1376,6 +1661,7 @@ class SaaSInstance(models.Model):
             raise UserError(_('Instance has no domain configured.'))
 
         count = self._get_users_count_from_instance()
+        self.last_users_count = count
         percentage = (count / self.user_limit * 100) if self.user_limit else 0
 
         return {
@@ -1497,7 +1783,12 @@ class SaaSInstance(models.Model):
                 'Check that saas_agent is installed and the server master password is correct.'
             ))
 
-        user_login = self.agent_impersonate_login or self.admin_login or 'admin'
+        user_login = self.agent_impersonate_login or self.admin_login
+        if not user_login or user_login.lower() in ('__system__', 'public'):
+            raise UserError(_(
+                'No SSO target login configured. Set the "SSO Login" field '
+                'on the instance (system accounts cannot be impersonated).'
+            ))
         token = self._build_agent_jwt('sso', {
             'user_login': user_login,
             'redirect': '/web',
@@ -1598,6 +1889,7 @@ class SaaSInstance(models.Model):
         success_count = 0
         for instance in instances:
             try:
+                instance.last_users_count = instance._get_users_count_from_instance()
                 if instance._send_user_limit_to_instance():
                     success_count += 1
                     instance.write({'last_sync_date': fields.Datetime.now()})
@@ -1613,23 +1905,66 @@ class SaaSInstance(models.Model):
     def cron_check_user_limits(self):
         """
         CRON: Vérifier les limites d'utilisateurs et alerter.
-        CRON: Check user limits and alert.
-        
-        TODO Phase 2: Implement limit checking
+
+        Seuils (config params) :
+        - saas.user_limit_warn_percent  (défaut 80)  → message chatter
+        - saas.user_limit_alert_percent (défaut 95)  → activity + email manager
         """
         _logger.info("Running user limit check...")
-        
-        active_instances = self.search([('state', '=', 'active')])
-        
-        for instance in active_instances:
+
+        ICP = self.env['ir.config_parameter'].sudo()
+        warn_pct = float(ICP.get_param('saas.user_limit_warn_percent', '80') or 80)
+        alert_pct = float(ICP.get_param('saas.user_limit_alert_percent', '95') or 95)
+
+        admin_users = self._get_saas_admin_users()
+        activity_type = 'saas_manager.mail_act_saas_alert'
+
+        instances = self.search([
+            ('state', 'in', ['active', 'suspended']),
+            ('user_limit', '>', 0),
+        ])
+
+        for instance in instances:
             try:
-                # TODO Phase 2: Query instance database for user count
-                # Compare with plan.user_limit
-                # Send alert if limit exceeded
-                pass
-                
+                count = instance._get_users_count_from_instance()
+                instance.write({'last_users_count': count})
+
+                pct = (count / instance.user_limit) * 100
+
+                if pct >= alert_pct:
+                    body = _(
+                        "User limit ALMOST EXCEEDED: %(count)d / %(limit)d users "
+                        "(%(pct).0f%%) on instance %(name)s.",
+                        count=count, limit=instance.user_limit, pct=pct, name=instance.name,
+                    )
+                    instance.message_post(
+                        body=body,
+                    )
+                    for user in admin_users:
+                        try:
+                            instance.activity_schedule(
+                                activity_type, user_id=user.id, note=body,
+                            )
+                        except Exception as act_exc:
+                            _logger.warning(
+                                "Could not schedule limit activity on %s: %s",
+                                instance.name, act_exc,
+                            )
+                    _logger.warning("User limit alert for %s: %.0f%%", instance.name, pct)
+
+                elif pct >= warn_pct:
+                    instance.message_post(
+                        body=_(
+                            "User limit warning: %(count)d / %(limit)d users (%(pct).0f%%).",
+                            count=count, limit=instance.user_limit, pct=pct,
+                        ),
+                    )
+                    _logger.info("User limit warning for %s: %.0f%%", instance.name, pct)
+
             except Exception as e:
                 _logger.error(f"Limit check failed for {instance.name}: {str(e)}")
+
+        _logger.info("User limit check done: %d instances checked", len(instances))
 
     @api.model_create_multi
     def create(self, vals_list):

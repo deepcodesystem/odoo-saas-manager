@@ -109,8 +109,9 @@ class SaaSServer(models.Model):
     )
     master_password = fields.Char(
         string='Master Password',
-        default='admin',
-        help="Odoo master password for database operations"
+        help="Odoo master password for database operations. "
+             "Required to provision/terminate instances on this server.",
+        copy=False,
     )
     verify_ssl = fields.Boolean(
         string='Vérifier SSL',

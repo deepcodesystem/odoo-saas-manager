@@ -29,7 +29,7 @@ class TestSaaSInstanceRPC(TransactionCase):
             'db_port': 5432,
             'db_user': 'odoo',
             'db_password': 'odoo',
-            'master_password': 'admin',
+            'master_password': 'test-master-pw',
             'cpu_cores': 4,
             'memory_gb': 16,
             'disk_gb': 500,
@@ -41,19 +41,8 @@ class TestSaaSInstanceRPC(TransactionCase):
         self.template = self.env['saas.template'].create({
             'name': 'Test Template',
             'code': 'test-template-rpc',
-            'description': 'Template for RPC testing',
+            'template_db': 'template_test_rpc',
             'server_id': self.server.id,
-            'state': 'active',
-        })
-
-        # Create a test plan
-        self.plan = self.env['saas.plan'].create({
-            'name': 'Professional Plan',
-            'code': 'professional-rpc',
-            'user_limit': 10,
-            'storage_limit': 50.0,
-            'price_monthly': 99.0,
-            'price_yearly': 999.0,
         })
 
         # Create a test partner
@@ -67,49 +56,29 @@ class TestSaaSInstanceRPC(TransactionCase):
             'name': 'Test Instance',
             'partner_id': self.partner.id,
             'template_id': self.template.id,
-            'plan_id': self.plan.id,
             'server_id': self.server.id,
             'database_name': 'test_instance_db',
             'subdomain': 'test-instance-rpc',
-            'admin_login': 'admin',
+            'admin_login': 'client-admin@example.com',
             'admin_password': 'test123',
+            'user_limit': 10,
             'state': 'active',
         })
 
-    def test_compute_user_limit_from_plan(self):
-        """Test that user_limit is computed from plan"""
+    def test_user_limit_field(self):
+        """Test user_limit is settable and stored"""
         self.assertEqual(self.instance.user_limit, 10)
-        self.assertEqual(self.instance.plan_id.user_limit, 10)
-
-    def test_compute_user_limit_default(self):
-        """Test default user limit when plan has no limit"""
-        # Create instance without plan
-        instance = self.env['saas.instance'].create({
-            'name': 'Test Instance 2',
-            'partner_id': self.partner.id,
-            'template_id': self.template.id,
-            'plan_id': self.plan.id,
-            'server_id': self.server.id,
-            'database_name': 'test_instance_db_2',
-            'subdomain': 'test-instance-2-rpc',
-            'admin_login': 'admin',
-            'admin_password': 'test123',
-            'state': 'draft',
-        })
-        
-        # Should have default limit from plan
-        self.assertGreater(instance.user_limit, 0)
 
     def test_compute_users_percentage(self):
         """Test users percentage calculation"""
-        # Mock current users
-        with patch.object(type(self.instance), '_get_users_count_from_instance', return_value=5):
-            self.instance._compute_current_users()
-            self.assertEqual(self.instance.current_users, 5)
-            
-            # Calculate percentage
-            self.instance._compute_users_percentage()
-            self.assertEqual(self.instance.users_percentage, 50.0)
+        # Simulate last synced count
+        self.instance.last_users_count = 5
+        self.instance._compute_current_users()
+        self.assertEqual(self.instance.current_users, 5)
+
+        # Calculate percentage
+        self.instance._compute_users_percentage()
+        self.assertEqual(self.instance.users_percentage, 50.0)
 
     def test_compute_users_percentage_zero_limit(self):
         """Test users percentage with zero limit"""
@@ -117,6 +86,16 @@ class TestSaaSInstanceRPC(TransactionCase):
         self.instance.user_limit = 0
         self.instance._compute_users_percentage()
         self.assertEqual(self.instance.users_percentage, 0.0)
+
+    def test_compute_current_users_no_rpc(self):
+        """Compute must NOT trigger an RPC call (uses last_users_count)"""
+        with patch.object(
+            type(self.instance), '_get_users_count_from_instance'
+        ) as mock_rpc:
+            self.instance.last_users_count = 3
+            self.instance._compute_current_users()
+            self.assertEqual(self.instance.current_users, 3)
+            mock_rpc.assert_not_called()
 
     @patch('requests.post')
     def test_send_user_limit_success(self, mock_post):
@@ -236,24 +215,22 @@ class TestSaaSInstanceRPC(TransactionCase):
 
     def test_action_sync_user_limit_no_domain(self):
         """Test manual sync action without domain"""
-        # Create instance without domain
-        instance = self.env['saas.instance'].create({
-            'name': 'Test Instance No Domain',
-            'partner_id': self.partner.id,
-            'template_id': self.template.id,
-            'plan_id': self.plan.id,
-            'server_id': self.server.id,
-            'database_name': 'test_no_domain_db',
-            'subdomain': '',  # No subdomain
-            'admin_login': 'admin',
-            'admin_password': 'test123',
-            'state': 'active',
-        })
+        # Remove the subdomain and domain via SQL (required/computed stored
+        # fields, bypassed for the test)
+        self.env.cr.execute(
+            "UPDATE saas_instance SET subdomain = '', domain = '' WHERE id = %s",
+            [self.instance.id],
+        )
+        self.instance.invalidate_recordset(['subdomain', 'domain'])
+        # Force recompute of the stored computed domain from the empty subdomain
+        self.env.add_to_compute(self.instance._fields['domain'], self.instance)
+        self.env.flush_all()
+        self.assertFalse(self.instance.domain)
 
         # Should raise error
         with self.assertRaises(UserError) as context:
-            instance.action_sync_user_limit()
-        
+            self.instance.action_sync_user_limit()
+
         self.assertIn('no domain', str(context.exception).lower())
 
     def test_action_sync_user_limit_wrong_state(self):
@@ -264,7 +241,7 @@ class TestSaaSInstanceRPC(TransactionCase):
         # Should raise error
         with self.assertRaises(UserError) as context:
             self.instance.action_sync_user_limit()
-        
+
         self.assertIn('active', str(context.exception).lower())
 
     @patch('requests.post')
@@ -273,7 +250,7 @@ class TestSaaSInstanceRPC(TransactionCase):
         # Mock successful response
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {'success': True}
+        mock_response.json.return_value = {'success': True, 'current_users': 5}
         mock_post.return_value = mock_response
 
         # Create another active instance
@@ -281,12 +258,12 @@ class TestSaaSInstanceRPC(TransactionCase):
             'name': 'Test Instance 2',
             'partner_id': self.partner.id,
             'template_id': self.template.id,
-            'plan_id': self.plan.id,
             'server_id': self.server.id,
             'database_name': 'test_instance_2_db',
             'subdomain': 'test-instance-2-cron',
-            'admin_login': 'admin',
+            'admin_login': 'client-admin2@example.com',
             'admin_password': 'test123',
+            'user_limit': 10,
             'state': 'active',
         })
 
@@ -296,6 +273,7 @@ class TestSaaSInstanceRPC(TransactionCase):
         # Verify both instances were synced
         self.assertIsNotNone(self.instance.last_sync_date)
         self.assertIsNotNone(instance2.last_sync_date)
+        self.assertEqual(self.instance.last_users_count, 5)
 
     def test_inactive_instance_not_synced(self):
         """Test that inactive instances are not synced"""
@@ -312,9 +290,66 @@ class TestSaaSInstanceRPC(TransactionCase):
         """Test current users computation for inactive instance"""
         # Set instance to draft
         self.instance.state = 'draft'
-        
+
         # Compute current users
         self.instance._compute_current_users()
-        
+
         # Should be 0
         self.assertEqual(self.instance.current_users, 0)
+
+    def test_sso_login_refused_without_target(self):
+        """SSO login must refuse system accounts and empty targets"""
+        self.env['ir.config_parameter'].sudo().set_param('saas.base_domain', 'example.com')
+        self.instance.write({
+            'admin_login': '__system__',
+            'agent_impersonate_login': False,
+        })
+        with self.assertRaises(UserError):
+            self.instance.action_sso_login()
+
+    def test_sso_login_allows_client_admin(self):
+        """SSO login must still allow the client admin account (uid 2)"""
+        self.env['ir.config_parameter'].sudo().set_param('saas.base_domain', 'example.com')
+        self.instance.write({
+            'admin_login': 'admin',
+            'agent_impersonate_login': False,
+        })
+        token_payload = None
+
+        def fake_jwt_encode(payload, secret, algorithm='HS256'):
+            nonlocal token_payload
+            token_payload = payload
+            return 'fake-token'
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {'success': True}
+
+        with patch('odoo.addons.saas_manager.models.saas_instance.jwt.encode', side_effect=fake_jwt_encode), \
+             patch('odoo.addons.saas_manager.models.saas_instance.requests.post', return_value=mock_response):
+            action = self.instance.action_sso_login()
+        self.assertEqual(action['type'], 'ir.actions.act_url')
+        self.assertIn('token=fake-token', action['url'])
+        self.assertEqual(token_payload.get('user_login'), 'admin')
+
+    def test_unique_constraints(self):
+        """Database name and subdomain must be unique"""
+        with self.assertRaises(Exception):
+            self.env['saas.instance'].create({
+                'name': 'Dup Instance',
+                'partner_id': self.partner.id,
+                'template_id': self.template.id,
+                'server_id': self.server.id,
+                'database_name': 'test_instance_db',  # duplicate
+                'subdomain': 'dup-subdomain',
+                'state': 'draft',
+            })
+
+    def test_master_password_not_default_admin(self):
+        """New servers must not get a default 'admin' master password"""
+        server = self.env['saas.server'].create({
+            'name': 'No Default PW Server',
+            'code': 'no-default-pw',
+            'server_url': 'https://saas2.example.com',
+        })
+        self.assertFalse(server.master_password)

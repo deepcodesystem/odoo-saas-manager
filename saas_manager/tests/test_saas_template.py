@@ -19,10 +19,22 @@ class TestSaaSTemplateCreation(TransactionCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.template_model = cls.env['saas.template']
+        cls.server = cls.env['saas.server'].create({
+            'name': 'Template Test Server',
+            'code': 'template-test-server',
+            'server_url': 'https://saas-template-test.example.com',
+        })
+
+    def _create_template(self, **kwargs):
+        vals = {
+            'server_id': self.server.id,
+        }
+        vals.update(kwargs)
+        return self.template_model.create(vals)
 
     def test_create_template_record(self):
         """Test: Créer un enregistrement template"""
-        template = self.template_model.create({
+        template = self._create_template(**{
             'name': 'Test Template',
             'code': 'test_template',
             'template_db': 'template_test',
@@ -37,7 +49,7 @@ class TestSaaSTemplateCreation(TransactionCase):
     def test_template_code_must_be_lowercase(self):
         """Test: Le code template doit être en minuscules"""
         with self.assertRaises(Exception):
-            self.template_model.create({
+            self._create_template(**{
                 'name': 'Invalid Template',
                 'code': 'InvalidCode',  # Should be lowercase
                 'template_db': 'template_invalid',
@@ -45,14 +57,14 @@ class TestSaaSTemplateCreation(TransactionCase):
 
     def test_template_db_unique(self):
         """Test: Le nom de la base template doit être unique"""
-        self.template_model.create({
+        self._create_template(**{
             'name': 'Template 1',
             'code': 'template1',
             'template_db': 'template_unique',
         })
 
         with self.assertRaises(Exception):
-            self.template_model.create({
+            self._create_template(**{
                 'name': 'Template 2',
                 'code': 'template2',
                 'template_db': 'template_unique',  # Duplicate
@@ -60,7 +72,7 @@ class TestSaaSTemplateCreation(TransactionCase):
 
     def test_instance_count_computation(self):
         """Test: Le compte des instances est calculé correctement"""
-        template = self.template_model.create({
+        template = self._create_template(**{
             'name': 'Count Test',
             'code': 'count_test',
             'template_db': 'template_count',
@@ -71,7 +83,7 @@ class TestSaaSTemplateCreation(TransactionCase):
 
     def test_version_increment(self):
         """Test: La version s'incrémente correctement"""
-        template = self.template_model.create({
+        template = self._create_template(**{
             'name': 'Version Test',
             'code': 'version_test',
             'template_db': 'template_version',
@@ -86,7 +98,7 @@ class TestSaaSTemplateCreation(TransactionCase):
 
     def test_cannot_create_template_db_without_ready(self):
         """Test: Impossible de cloner un template non prêt"""
-        template = self.template_model.create({
+        template = self._create_template(**{
             'name': 'Not Ready',
             'code': 'not_ready',
             'template_db': 'template_not_ready',

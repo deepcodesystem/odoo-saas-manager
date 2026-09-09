@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <!-- Titre des pages web / portal : nom système au lieu de Odoo -->
+    <template id="deep_layout" inherit_id="web.layout" name="DeepOS Web layout">
+        <xpath expr="//title" position="replace">
+            <title t-if="title" t-esc="title"/>
+            <title t-else="1" t-esc="request and request.env['ir.config_parameter'].sudo().get_param('app_system_name') or 'DeepOS'"/>
+        </xpath>
+    </template>
+
+    <!-- Page de login : "Powered by" personnalisable via paramètres -->
+    <template id="replace_login" name="DeepOS Login Layout" inherit_id="web.login_layout">
+        <xpath expr="//div[hasclass('text-center', 'small', 'mt-4', 'pt-3', 'border-top')]" position="replace">
+            <div class="text-center small mt-4 pt-3 border-top" t-if="not disable_footer and request.env['ir.config_parameter'].sudo().get_param('app_show_poweredby') in ('True', '1')">
+                <t t-set="poweredby_text" t-value="request.env['ir.config_parameter'].sudo().get_param('app_poweredby_text') or 'DeepOS'"/>
+                <t t-set="poweredby_url" t-value="request.env['ir.config_parameter'].sudo().get_param('app_poweredby_url') or ''"/>
+                <t t-if="poweredby_url">
+                    <a t-att-href="poweredby_url" target="_blank">Powered by <span t-esc="poweredby_text"/></a>
+                </t>
+                <t t-else="">
+                    <span>Powered by <span t-esc="poweredby_text"/></span>
+                </t>
+            </div>
+        </xpath>
+    </template>
+</odoo>

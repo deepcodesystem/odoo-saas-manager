@@ -1,0 +1,18 @@
+/* Ruban d'environnement (OCA web_environment_ribbon) */
+.test-ribbon {
+    background: rgba(255, 0, 0, 0.4);
+    color: #f0f0f0;
+    font-family: "Monaco", "Menlo", "Ubuntu Mono", "Courier New", monospace;
+    font-size: 0.8rem;
+    left: -50px;
+    line-height: 2;
+    overflow: hidden;
+    padding: 0 50px;
+    position: fixed;
+    text-align: center;
+    top: 30px;
+    transform: rotate(-45deg);
+    width: 200px;
+    z-index: 9999;
+    box-shadow: 0 0 4px rgba(0, 0, 0, 0.3);
+}
