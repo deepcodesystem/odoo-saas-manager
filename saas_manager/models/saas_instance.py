@@ -1369,6 +1369,53 @@ class SaaSInstance(models.Model):
             )
             return False
 
+    def action_resend_provisioning_email(self):
+        """
+        Renvoyer l'email de provisioning au client.
+        Resend the provisioning email to the customer.
+
+        Appelé depuis le bouton "Resend Provisioning Email" de la vue form.
+        Called from the "Resend Provisioning Email" button in the form view.
+        """
+        for instance in self:
+            if not instance.partner_id.email:
+                raise UserError(_(
+                    'Customer %s has no email address. '
+                    'Please set an email address on the customer before '
+                    'resending the provisioning email.',
+                ) % (instance.partner_id.name or _('Unknown')))
+
+            sent = instance._send_instance_email('provisioned')
+
+            if sent:
+                instance.message_post(body=_(
+                    'Provisioning email resent to %s',
+                ) % instance.partner_id.email)
+
+        if len(self) == 1:
+            title = _('Email Resent')
+            message = _(
+                'The provisioning email has been resent to %s',
+            ) % self.partner_id.email
+            notification_type = 'success'
+        else:
+            title = _('Emails Resent')
+            message = _(
+                'The provisioning email has been resent for %s instance(s).',
+            ) % len(self)
+            notification_type = 'success'
+
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': title,
+                'message': message,
+                'type': notification_type,
+                'sticky': False,
+            }
+        }
+
     def action_suspend(self):
         """
         Suspendre l'instance (non-paiement, expiration).

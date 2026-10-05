@@ -36,6 +36,13 @@
                                 class="btn-secondary"
                                 invisible="state not in ['active', 'suspended']"
                                 icon="fa-users"/>
+                        <button name="action_resend_provisioning_email"
+                                type="object"
+                                string="Resend Provisioning Email"
+                                class="btn-secondary"
+                                groups="saas_manager.group_saas_admin"
+                                invisible="state in ['terminated', 'draft']"
+                                icon="fa-envelope"/>
                         <button name="action_suspend"
                                 type="object" 
                                 string="Suspend"
